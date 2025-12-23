@@ -57,7 +57,7 @@ async function run() {
     const paymentsHistoryCollection = db.collection('payments')
     const reviewsCollection = db.collection('reviews')
     const favoritesCollection = db.collection('favorites')
-    const chefRequestCollection = db.collection('chefRequest')
+    const roleRequestCollection = db.collection('roleRequest')
     const chefCollection = db.collection('chef')
 
 
@@ -65,7 +65,14 @@ async function run() {
     // ====================== Save Or update a user in db ======================
     app.post('/role-requests', verifyJWT, async (req, res) => {
       const chef = req.body
-      const result = await chefCollection.insertOne(chef)
+      const exists = await roleRequestCollection.findOne({
+        userEmail: chef.userEmail,
+        requestStatus: 'pending'
+      })
+      if (exists) {
+        return res.status(409).send({ message: 'Request already pending' })
+      }
+      const result = await roleRequestCollection.insertOne(chef)
       res.send(result)
     })
 
@@ -74,7 +81,7 @@ async function run() {
       if (req.query.requestStatus) {
         query.requestStatus = req.query.requestStatus
       }
-      const cursor = chefCollection.find(query)
+      const cursor = roleRequestCollection.find(query)
       const result = await cursor.toArray()
       res.send(result)
 
@@ -84,24 +91,41 @@ async function run() {
     app.patch('/role-requests/approve/:id', verifyJWT, async (req, res) => {
       const { id } = req.params
       const { userEmail, role } = req.body
+      console.log(userEmail, role, id)
       try {
-        const request = await chefCollection.findOne({ _id: new ObjectId(id) })
+        const request = await roleRequestCollection.findOne({ _id: new ObjectId(id) })
         if (!request) return res.status(404).send({ message: 'Request not found' })
+        const adminUser = await usersCollection.findOne({ email: req.tokenEmail })
+        if (!adminUser || adminUser.role !== 'admin') {
+          return res.status(403).send({ message: 'Forbidden Access!' })
+        }
+
 
         // Update user role
         const updateUserData = { role }
+        let chefId = null
         if (role === 'chef') {
           // Generate unique chefId
-          const chefId = `chef-${Math.floor(1000 + Math.random() * 9000)}`
+          chefId = `chef-${Math.floor(1000 + Math.random() * 9000)}`
           updateUserData.chefId = chefId
+          await chefCollection.insertOne({
+            chefId,
+            userEmail,
+            createdAt: new Date(),
+            verified: true,
+            rating: 0,
+            totalOrders: 0
+          })
+
+
         }
-        const userResult = await usersCollection.updateOne(
+        await usersCollection.updateOne(
           { email: userEmail },
           { $set: updateUserData }
         )
 
         // Update request status
-        await chefCollection.updateOne(
+        await roleRequestCollection.updateOne(
           { _id: new ObjectId(id) },
           { $set: { requestStatus: 'approved', approvedAt: new Date(), chefId } }
         )
@@ -118,7 +142,7 @@ async function run() {
       const { id } = req.params
 
       try {
-        await chefCollection.updateOne(
+        await roleRequestCollection.updateOne(
           { _id: new ObjectId(id) },
           { $set: { requestStatus: 'rejected', rejectedAt: new Date() } }
         )
@@ -167,51 +191,50 @@ async function run() {
 
     // PATCH: Make user fraud
     app.patch('/users/fraud/:id', verifyJWT, async (req, res) => {
-      try {
-        // Only admins can perform this action
-        const adminUser = await usersCollection.findOne({ email: req.tokenEmail });
-        if (!adminUser || adminUser.role !== 'admin') {
-          return res.status(403).send({ message: 'Forbidden Access!' });
-        }
-
-        const userId = req.params.id;
-        if (!ObjectId.isValid(userId)) return res.status(400).send({ message: 'Invalid ID' });
-
-        const user = await usersCollection.findOne({ _id: new ObjectId(userId) });
-        if (!user) return res.status(404).send({ message: 'User not found' });
-
-        if (user.role === 'admin') {
-          return res.status(400).send({ message: 'Cannot mark admin as fraud' });
-        }
-        if (user.status === 'fraud') {
-          return res.status(400).send({ message: 'User is already fraud' });
-        }
-
-        const result = await usersCollection.updateOne(
-          { _id: new ObjectId(userId) },
-          { $set: { status: 'fraud' } }
-        );
-
-        res.send({ success: true, message: `${user.name} is marked as fraud.` });
-      } catch (err) {
-        console.error(err);
-        res.status(500).send({ message: 'Server error' });
+      const adminUser = await usersCollection.findOne({ email: req.tokenEmail })
+      if (!adminUser || adminUser.role !== 'admin') {
+        return res.status(403).send({ message: 'Forbidden Access!' })
       }
-    });
+
+      const userId = req.params.id
+      const user = await usersCollection.findOne({ _id: new ObjectId(userId) })
+      if (!user) return res.status(404).send({ message: 'User not found' })
+
+      // mark user fraud
+      await usersCollection.updateOne(
+        { _id: user._id },
+        { $set: { status: 'fraud' } }
+      )
+
+      // IMPORTANT PART (Chef cleanup)
+      if (user.role === 'chef' && user.chefId) {
+        await chefCollection.updateOne(
+          { chefId: user.chefId },
+          { $set: { verified: false, disabledAt: new Date() } }
+        )
+      }
+
+      res.send({ success: true, message: 'User marked as fraud' })
+    })
+
 
 
     // ====================== MEALS ======================
     app.post('/add-meal', verifyJWT, async (req, res) => {
       const mealData = req.body
-      console.log(mealData)
       const result = await mealsCollection.insertOne(mealData)
       res.send(result)
     })
 
     app.get('/meals', async (req, res) => {
-      const result = await mealsCollection.find().toArray()
+      const result = await mealsCollection
+        .find()
+        .sort({ createdAt: -1 })
+        .toArray()
+
       res.send(result)
     })
+
 
     app.get('/meals/:id', async (req, res) => {
       const id = req.params.id
@@ -285,7 +308,6 @@ async function run() {
 
     app.get('/my-review/:email', async (req, res) => {
       const email = req.params.email
-      console.log(email)
       const orders = await reviewsCollection.find({ userEmail: email }).sort({ orderTime: -1 }).toArray()
       res.send(orders)
     })
@@ -403,22 +425,30 @@ async function run() {
       res.send(meals)
     })
     // Get seller Created Meals
-    app.get('/seller-order', async (req, res) => {
-      const email = req.params.email
-      const meals = await mealsCollection.find({ userEmail: email }).sort({ orderTime: -1 }).toArray()
-      res.send(meals)
-    })
+    // app.get('/seller-order', async (req, res) => {
+    //   const email = req.params.email
+    //   const meals = await mealsCollection.find({ userEmail: email }).sort({ orderTime: -1 }).toArray()
+    //   res.send(meals)
+    // })
 
     app.get('/chef-orders/:chefId', verifyJWT, async (req, res) => {
       const chefId = req.params.chefId
-      const orders = await ordersCollection
-        .find({ chefId })
-        .sort({ orderTime: -1 })
-        .toArray()
+      const user = await usersCollection.findOne({ email: req.tokenEmail })
 
+      if (!user || user.role !== 'chef' || user.chefId !== chefId) {
+        return res.status(403).send({ message: 'Forbidden Access!' })
+      }
+
+      const orders = await ordersCollection.find({ chefId }).toArray()
       res.send(orders)
     })
-
+    app.delete('/order-cancel/:id', verifyJWT, async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) }
+      const result = await ordersCollection.deleteOne(query);
+      res.send(result);
+    })
+ 
 
     app.delete('/seller-created-meals/:id', async (req, res) => {
       const id = req.params.id;
@@ -441,23 +471,27 @@ async function run() {
 
     // Update order status by chef
     app.patch('/orders/status/:id', verifyJWT, async (req, res) => {
-      const { status } = req.body
-      const id = req.params.id
+      const user = await usersCollection.findOne({ email: req.tokenEmail })
+      if (!user || user.role !== 'chef') {
+        return res.status(403).send({ message: 'Chef only' })
+      }
 
+      const order = await ordersCollection.findOne({ _id: new ObjectId(req.params.id) })
+      if (!order || order.chefId !== user.chefId) {
+        return res.status(403).send({ message: 'Not your order' })
+      }
+
+      const { status } = req.body
       if (!['cancelled', 'accepted', 'delivered'].includes(status)) {
         return res.status(400).send({ message: 'Invalid status' })
       }
 
-      const result = await ordersCollection.updateOne(
-        { _id: new ObjectId(id) },
-        {
-          $set: {
-            orderStatus: status
-          }
-        }
+      await ordersCollection.updateOne(
+        { _id: order._id },
+        { $set: { orderStatus: status } }
       )
 
-      res.send(result)
+      res.send({ success: true })
     })
 
 

@@ -165,13 +165,17 @@ async function run() {
     })
 
 
-    app.get('/user/role/', verifyJWT, async (req, res) => {
-
-      const email = req.params.email
-
-      const result = await usersCollection.findOne({ email: req.tokenEmail })
-      res.send(result)
+    app.get('/user/role', verifyJWT, async (req, res) => {
+      try {
+        const result = await usersCollection.findOne({ email: req.tokenEmail })
+        if (!result) return res.status(404).send({ message: 'User not found' })
+        res.send({ role: result.role }) // শুধু role পাঠাও
+      } catch (err) {
+        console.error(err)
+        res.status(500).send({ message: 'Server error', err })
+      }
     })
+
     // ====================== MANAGE USERS (ADMIN) ======================
     app.get('/users', verifyJWT, async (req, res) => {
       try {
@@ -424,12 +428,68 @@ async function run() {
       const meals = await mealsCollection.find({ userEmail: email }).sort({ orderTime: -1 }).toArray()
       res.send(meals)
     })
-    // Get seller Created Meals
-    // app.get('/seller-order', async (req, res) => {
-    //   const email = req.params.email
-    //   const meals = await mealsCollection.find({ userEmail: email }).sort({ orderTime: -1 }).toArray()
-    //   res.send(meals)
-    // })
+    app.get('/orders/total-payment/stats', async (req, res) => {
+      const pipeline = [
+        {
+          $group: {
+            _id: '$amount',
+            count: { $sum: 1 }
+          }
+        }
+      ]
+
+      const result = await paymentsHistoryCollection.aggregate(pipeline).toArray();
+      res.send(result);
+
+
+    })
+
+    // ====================== ADMIN STATISTICS ======================
+    app.get('/admin/statistics', verifyJWT, async (req, res) => {
+      try {
+        // check admin
+        const adminUser = await usersCollection.findOne({ email: req.tokenEmail })
+        if (!adminUser || adminUser.role !== 'admin') {
+          return res.status(403).send({ message: 'Forbidden Access!' })
+        }
+
+        // Total users
+        const totalUsers = await usersCollection.countDocuments()
+
+        // Orders stats
+        const pendingOrders = await ordersCollection.countDocuments({
+          orderStatus: 'pending',
+        })
+
+        const deliveredOrders = await ordersCollection.countDocuments({
+          orderStatus: 'delivered',
+        })
+
+        // Total payment amount
+        const paymentAgg = await paymentsHistoryCollection.aggregate([
+          {
+            $group: {
+              _id: null,
+              totalAmount: { $sum: '$amount' },
+            },
+          },
+        ]).toArray()
+
+        const totalPaymentAmount =
+          paymentAgg.length > 0 ? paymentAgg[0].totalAmount : 0
+
+        res.send({
+          totalUsers,
+          pendingOrders,
+          deliveredOrders,
+          totalPaymentAmount,
+        })
+      } catch (error) {
+        console.error(error)
+        res.status(500).send({ message: 'Server error' })
+      }
+    })
+
 
     app.get('/chef-orders/:chefId', verifyJWT, async (req, res) => {
       const chefId = req.params.chefId
@@ -448,7 +508,7 @@ async function run() {
       const result = await ordersCollection.deleteOne(query);
       res.send(result);
     })
- 
+
 
     app.delete('/seller-created-meals/:id', async (req, res) => {
       const id = req.params.id;
